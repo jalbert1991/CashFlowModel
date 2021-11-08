@@ -15,7 +15,7 @@ pd.set_option('display.max_columns', 500)
 #import GUI.index as gui
 gui.app.run_server(debug=False)
 
-
+pd.options.display.float_format = '{:20,.2f}'.format
 
 
 import DataPrep.DataMover as data_prep
@@ -382,25 +382,63 @@ import CashFlowModelMain as cf_main
 import numpy as np
 import pandas as pd
 
-download_model = cf_main.CashFlowModel.load_model(model_name='Galileo', uw_month=201909) 
-download_model.run_cash_flows(['Base Case'])
+new_template = cf_main.CashFlowModel.create_template('solar')
+new_template
 
+template = cf_main.CashFlowModel.load_model(model_name='Solar Template')
+
+download_model = cf_main.CashFlowModel.load_model(model_name='Faraday', uw_month=None) 
+download_model.set_final_scenario('Base2')
+
+
+download_model.import_data_tape_sql() 
+download_model.run_cash_flows() 
+
+download_model.eval.create_avp()
+
+
+refresh_model = cf_main.CashFlowModel.refresh_model(model_name='Faraday', uw_month=202108)
+refresh_model.run_cash_flows()
+refresh_model.eval.create_avp()
+
+refresh_model.cf_scenarios
+
+
+
+month_end_date = datetime.date(int(str(uw_month)[0:4]), int(str(uw_month)[4:6]), 1) + relativedelta(months=-1, day=31)
+new_cutoff = month_end_date.strftime("%Y-%m-%d")
+
+
+download_model.rate_curve_groups['Solar Asset Class - 201909'].map_segments_to_curves('recovery')
+download_model.rate_curve_groups['Solar Asset Class - 201909'].segments['recovery'].segment_rules __dict__.keys()
 
 download_model= cf_main.CashFlowModel.load_model(model_name='Casser')
 download_model.run_cash_flows(['Casser 052021 Backtest v2'])
+download_model.import_rate_curves_sql(curve_group_name='single_curve_test', source_curve_group_name='FaradayOrigP2', update_curve_map=False)
+download_model.rate_curve_groups['FaradayOrigP1'].segment_curve_map
+download_model.rate_curve_groups['FaradayOrigP1'].segment_map_manual
 
-
-download_model = cf_main.CashFlowModel.load_model(model_name='VoyagerFF')
+download_model = cf_main.CashFlowModel.load_model(model_name='Voyager2')
 download_model.run_cash_flows()
 download_model.cf_scenarios
 download_model.run_single_account(scenario='Base', account_id=20618302)
+download_model.eval.create_avp()
+download_model.cf_scenarios
+download_model.set_final_scenario('Stress2')
 
-download_model.eval.create_plot('ChargeOffAmount')
+
+
+
+
+
+
+download_model.eval.create_plot('PostChargeOffCollections')
 download_model.eval.create_table('PrincipalFullPrepayment')
 download_model.eval.create_avp()
 
 download_model.eval.return_metric_list()
-
+download_model.rate_curve_groups['VoyagerFFOrigP'].curves[('recovery', 'base')].data_rate_curves['rate'].values
+download_model.model_configs['VoyagerFFBase'].config_dict
 
 download_model.data_tape.cutoff_tape
 

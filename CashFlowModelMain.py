@@ -13,6 +13,7 @@ import pandas as pd
 import numpy as np
 import time
 import datetime as date
+from dateutil.relativedelta import relativedelta
 import warnings
 import itertools
 import json
@@ -40,7 +41,7 @@ import GUI.DataPrepGUI as GUI
 import EvalResults.EvalResults as Evaluate
 
 #set default settings
-pd.options.display.float_format = '{:20,.0f}'.format
+pd.options.display.float_format = '{:20,.2f}'.format
 
     
 class CashFlowModel():
@@ -55,7 +56,7 @@ class CashFlowModel():
         """
         initialize the Cash Flow Model and store model level parameters
         """
-       
+        
         self.model_id = model_id
         self.model_name = model_name
         self.deal_ids = deal_ids
@@ -81,7 +82,8 @@ class CashFlowModel():
         self.data_prep = DataPrep.DataPrep()
         self.gui_data_prep = GUI.DataPrepMain(self.data_prep)
         self.model_builder = CF_Models.ModelBuilder()
-        self.eval = Evaluate.AVP(self.cf_scenarios)
+        model_details = (self.model_name, self.model_id, self.deal_ids, self.batch_keys, self.uw_type, self.uw_month)
+        self.eval = Evaluate.AVP(self.cf_scenarios, model_details)
         
     @classmethod
     def load_model(cls, model_name, uw_month=None, scenario_list=[]):
@@ -92,8 +94,10 @@ class CashFlowModel():
         ============
         Model_name: str
             name of model to download
-        uw_month: str
-            the specific underwrite to download
+        uw_month: int
+            the specific underwrite to download (YYYMM)
+        hist_data: bool
+            if True, will import all history from DR. if false, will only import single month
         scenario_list: list
             optional:
             list of scenarios to download
@@ -117,7 +121,7 @@ class CashFlowModel():
                    m.create_ts,
                    m.create_user
     		FROM fra.cf_model.model m
-    			INNER JOIN fra.cf_model.model_uw u
+    			left JOIN fra.cf_model.model_uw u
     				ON u.model_key = m.model_key
             where 1=1 
                 and m.model_name='{}' 
@@ -129,9 +133,11 @@ class CashFlowModel():
         model_attr = model_attr.squeeze() 
         
         #create new model object
-        loaded_model = cls(int(model_attr['model_key']), model_attr['model_name'], json.loads(model_attr['deal_ids']), json.loads(model_attr['batch_keys']), model_attr['asset_class'], model_attr['uw_key'], model_attr['uw_type'])
+        loaded_model = cls(int(model_attr['model_key']), model_attr['model_name'], json.loads(model_attr['deal_ids']), json.loads(model_attr['batch_keys']), model_attr['asset_class'], model_attr['uw_key'], model_attr['uw_month'], model_attr['uw_type'])
         if model_attr['data_tape_source']=='cdw':
             loaded_model.import_data_tape_sql(source='cdw', save_source=False)
+        elif not model_attr['data_tape_source']:
+            pass
         elif model_attr['data_tape_source']!='excel':
             loaded_model.import_data_tape_sql(source='sql', query=model_attr['data_tape_source'], save_source=False)
         #Download CF Scenarios
@@ -139,6 +145,111 @@ class CashFlowModel():
         
         return loaded_model
         
+    @classmethod
+    def create_template(cls, asset_class):
+        """
+        creates/updates a template scenario for an asset class
+
+        Parameters
+        ======================
+        asset_class : str
+            Asset class that corresponds to the CAAM. Must match exactly to be picked up by the model 
+            on creating new models
+
+        """
+        
+        model_name= asset_class + ' template'
+        deal_ids = []
+        batch_keys = []
+        uw_month=None
+        uw_type='template'
+        
+        #check if any templates already exist
+        #if this asset class already exists download the most recent version
+        sql="""
+            SELECT TOP 1 model_key
+                ,model_name
+            	,scenario_key
+                ,data_tape_source
+            	,seq_order
+            FROM fra.cf_model.vw_scenario
+            WHERE 1=1
+            	AND uw_type='template'
+            	AND asset_class='{}'
+            ORDER BY seq_order
+        """.format(asset_class)
+        
+        model_attr = cls.sql_engine_model.execute(sql, output=True)
+        
+        if len(model_attr)==0:
+        
+            #create new model record
+            sql = """
+                    insert into FRA.cf_model.model
+                    values('{}', '{}', '{}', '{}', null, getdate(), user_name(), {}); 
+                    commit
+                    select @@identity
+                    """.format(model_name, asset_class, [], [], 0)
+  
+            #create model record
+            model_id = cls.sql_engine_model.execute(sql, output=True).iloc[0][0]
+            
+            #create new UW record
+            sql = """
+                    insert into fra.cf_model.model_uw
+                    values({}, '{}', '{}');
+                    commit
+                    select @@identity
+                """.format(model_id, uw_month, uw_type)
+            
+            uw_id = cls.sql_engine_model.execute(sql, output=True).iloc[0][0]
+        
+            new_model = cls(int(model_id), model_name, deal_ids, batch_keys, asset_class, int(uw_id), uw_month, uw_type) #asofdate
+            new_model.uw_id = uw_id
+        
+            print('New Template Created')
+        
+        else:
+            
+            print('Downloading Most Recent Template')
+            #raise Exception('This model name already exists. Please try another name')
+            #if this asset class already exists download the most recent version
+            sql="""
+                SELECT TOP 1 model_key
+                    ,model_name
+                    ,uw_key
+                	,scenario_key
+                    ,data_tape_source
+                	,seq_order
+                FROM fra.cf_model.vw_scenario
+                WHERE 1=1
+                	AND uw_type='template'
+                	AND asset_class='{}'
+                ORDER BY seq_order
+            """.format(asset_class)
+            
+            model_attr = cls.sql_engine_model.execute(sql, output=True)
+            
+            #create python model object
+            new_model = cls(int(model_attr['model_key']), model_attr['model_name'], deal_ids, batch_keys, asset_class, int(model_attr['uw_key']), uw_month,  uw_type)
+            
+            #download latest scenario
+            if len(model_attr)>0:
+                model_attr = model_attr.squeeze() 
+                new_model.model_template_key = model_attr['model_key']
+                new_model.model_template_name = model_attr['model_name']
+                #import data tape
+                if model_attr['data_tape_source']=='cdw':
+                    new_model.import_data_tape_sql(source='cdw', save_source=True)
+                elif model_attr['data_tape_source']!='excel':
+                    new_model.import_data_tape_sql(source='sql', query=model_attr['data_tape_source'], save_source=True)
+                #import latest scenario
+                #new_model.download_model_template()
+                #Download CF Scenarios
+                new_model.download_cf_scenario(model_attr['model_name'], uw_month, scenario_list=[], update_curve_map=False, save_scenario=False)
+            
+        return new_model
+    
     @classmethod
     def new_model(cls, model_name, deal_ids, batch_keys, asset_class, uw_month=None, uw_type=None): # cutoff_date=None,
         """
@@ -157,13 +268,16 @@ class CashFlowModel():
             user entered name for this model
         asset_class: str
             asset type. different model construction based on different assets
-        uw_month: str    
-            month the underwrite takes place
+        uw_month: int   
+            month the underwrite takes place (YYYMM)
         uw_type: str
             type of uw we are creating. 
-            Pricing, RUW, Template
+            Pricing, RUW, Test
         """
         
+        if not uw_month:
+            raise Exception('Please Enter a uw_month in this format: YYYYMM')
+            
         if uw_type=='test':
             test_model = 1
         else:
@@ -246,8 +360,8 @@ class CashFlowModel():
         ==========================
         model_name: str
             name for new model
-        uw_month: str
-            the month of the current UW
+        uw_month: int
+            the month of the current UW (YYYMM)
         uw_type: str
             underwrite type
             (pricing, ruw, refresh)
@@ -291,26 +405,108 @@ class CashFlowModel():
                 select @@identity
             """.format(model_attr['model_key'], uw_month, uw_type)
         
-        uw_id = cls.sql_engine.execute(sql, output=True)
+        uw_id = cls.sql_engine_model.execute(sql, output=True).iloc[0][0]
         
         #create new model object
         loaded_model = cls(int(model_attr['model_key']), model_name, json.loads(model_attr['deal_ids']), json.loads(model_attr['batch_keys']), model_attr['asset_class'], int(uw_id), uw_month, uw_type)
         loaded_model.uw_id = uw_id
         
+        #parse out new refresh cutoff
+        #if uw_type == 'refresh':
+        #month_end_date = date.date(int(str(uw_month)[0:4]), int(str(uw_month)[4:6]), 1) + relativedelta(day=31)
+        #new_cutoff = month_end_date.strftime("%Y-%m-%d")
+        
         if model_attr['data_tape_source']=='cdw':
+            #if uw_type=='refresh' and not data_tape:
+            #    cutoff_date=new_cutoff
+            #else: 
+            #    cutoff_date = None
             loaded_model.import_data_tape_sql(source='cdw', save_source=False)
+        elif not model_attr['data_tape_source']:
+            pass
         else:
             loaded_model.import_data_tape_sql(source='sql', query=model_attr['data_tape_source'],  save_source=False)
         #Download CF Scenarios from old model
-        loaded_model.download_cf_scenario(model_name, scenario_list = scenario_list, update_curve_map=False, refresh=True)
+        loaded_model.download_cf_scenario(model_name, scenario_list = scenario_list, update_curve_map=False, refresh_date=None)
         
+
         return loaded_model
     
-    def import_data_tape_sql(self, source='cdw', query='', save_source=True):
+    @classmethod
+    def refresh_model(cls, model_name, uw_month, data_tape=True):
+        """
+        Creates a new scenario for a monthly update. this is not considered a RUW. 
+        Just a quick update to the model for a 
+        
+        Parameters
+        ----------
+        model_name : str
+            name of the model to download.
+        uw_month : int
+            month of current refresh.
+        data_tape: bool
+            if true will download entire performance history. 
+            if false will only download the single month needed to run the refresh
+        
+        Returns
+        -------
+        CashFlowModel object
+
+        """
+
+        #download prior model setup
+        sql = """
+            select model_key
+                ,model_name
+            	,asset_class
+            	,deal_ids
+            	,batch_keys
+                ,data_tape_source
+            from fra.cf_model.model
+            where 1=1
+            	and model_name='{}'
+            """.format(model_name)
+        
+        model_attr = cls.sql_engine_model.execute(sql, output=True)
+        model_attr = model_attr.squeeze() 
+                
+        #create new uw record
+        sql = """
+                insert into fra.cf_model.model_uw
+                values({}, '{}', '{}');
+                commit
+                select @@identity
+            """.format(model_attr['model_key'], uw_month, 'refresh')
+        
+        uw_id = cls.sql_engine_model.execute(sql, output=True).iloc[0][0]
+        
+        #create new model object
+        loaded_model = cls(int(model_attr['model_key']), model_name, json.loads(model_attr['deal_ids']), json.loads(model_attr['batch_keys']), model_attr['asset_class'], int(uw_id), uw_month, 'refresh')
+        loaded_model.uw_id = uw_id
+        
+        #parse out new refresh cutoff (yyyymm to yyyy-mm-dd)
+        month_end_date = date.date(int(str(uw_month)[0:4]), int(str(uw_month)[4:6]), 1) + relativedelta(months=-1, day=31)
+        new_cutoff = month_end_date.strftime("%Y-%m-%d")
+        
+        #download data tape  
+        cutoff_date = new_cutoff if not data_tape else None
+        if model_attr['data_tape_source']=='cdw':
+            loaded_model.import_data_tape_sql(source='cdw', save_source=False, asofdate=cutoff_date)
+        elif not model_attr['data_tape_source']:
+            pass
+        else:
+            loaded_model.import_data_tape_sql(source='sql', query=model_attr['data_tape_source'], save_source=False, asofdate=cutoff_date)
+        
+        #Download CF Scenarios from old model
+        loaded_model.download_cf_scenario(model_name, scenario_list = [], update_curve_map=False, refresh_date=new_cutoff)
+        
+        return loaded_model
+        
+    def import_data_tape_sql(self, source='cdw', query='', save_source=True, asofdate=None):
         if source=='cdw':
             print('Importing Data Tape')
             asset_class = self.asset_class #if self.model_type==1 else None
-            self.data_tape = self.data_prep.import_data_tape_cdw(self.deal_ids, self.batch_keys, asset_class) #self.cutoff_date.strftime('%Y-%m-%d')
+            self.data_tape = self.data_prep.import_data_tape_cdw(self.deal_ids, self.batch_keys, asset_class, asofdate)
             self.eval.output_actuals(self.data_tape)
             print('Importing Prior Projections')
             self.prior_uw_projections = self.data_prep.import_projections_cdw(self.deal_ids, self.batch_keys, projection_level='deal')
@@ -320,7 +516,11 @@ class CashFlowModel():
                 self.data_prep.save_data_tape_source(model_name=self.model_name, dt_source=source)
             
         elif source=='sql':
-            self.data_tape = self.data_prep.import_data_tape_query(query)  #self.cutoff_date.strftime('%Y-%m-%d')
+            print('Importing Data Tape')
+            self.data_tape = self.data_prep.import_data_tape_query(query)  
+            print('Importing Prior Projections')
+            self.prior_uw_projections = self.data_prep.import_projections_cdw(self.deal_ids, self.batch_keys, projection_level='deal')
+            self.eval.output_hist_proj(self.prior_uw_projections)
             if save_source:
                 self.data_prep.save_data_tape_source(model_name=self.model_name, dt_source=query)
             
@@ -392,8 +592,11 @@ class CashFlowModel():
         
         #check if this cutoff date/projection date combo is already downloaded
         if (projection_date, cutoff_date) not in self.data_prep.index_projections:
-            self.data_prep.import_index_projections(projection_date=projection_date, cutoff_date=cutoff_date)
-        
+            try:
+                self.data_prep.import_index_projections(projection_date=projection_date, cutoff_date=cutoff_date)
+            except:
+                print('Warning: Error downloading Index Projections. No future rates have been downloaded.')
+                
     def copy_curves(self, curve_group_name, source_curve_group, curve_type=['all']):
         """
         Copies curves from a different curve_group
@@ -419,7 +622,7 @@ class CashFlowModel():
             self.import_rate_curves_sql(curve_group_name, source_curve_group_name=source_curve_group, curve_type=curve)
         
           
-    def import_rate_curves_sql(self, curve_group_name, source_curve_group_name=None, model_name=None, scenario_name=None, curve_type='all', curve_sub_type='all', update_curve_map=True):
+    def import_rate_curves_sql(self, curve_group_name, source_curve_group_name=None, model_name=None, uw_month=None, scenario_name=None, curve_type='all', curve_sub_type='all', update_curve_map=True):
         """
         Imports data from an existing curve group stored in the server. 
         must provide either
@@ -455,7 +658,7 @@ class CashFlowModel():
             self.create_curve_group(curve_group_name)
         
         #import and load curves, segments, and maps
-        self.data_prep.import_rate_curves_sql(self.rate_curve_groups[curve_group_name], source_curve_group_name, model_name, scenario_name, curve_type, curve_sub_type, update_curve_map)
+        self.data_prep.import_rate_curves_sql(self.rate_curve_groups[curve_group_name], source_curve_group_name, model_name, uw_month, scenario_name, curve_type, curve_sub_type, update_curve_map)
         
         if curve_type == 'all':
             self.rate_curve_groups[curve_group_name].update_all_mappings()
@@ -463,7 +666,10 @@ class CashFlowModel():
             self.rate_curve_groups[curve_group_name].map_segments_to_curves(curve_type)
         
         if self.data_tape:
-            self.rate_curve_groups[curve_group_name].create_account_map()
+            try:
+                self.rate_curve_groups[curve_group_name].create_account_map()
+            except:
+                print("Account Map could not be created.")
         
     def import_rate_curves_excel(self, curve_group_name, curve_type, curve_sub_type, file_path, ws_name, ws_range, key_cols=['Key'], period_type='MOB', pivot=False):
         ###########################################
@@ -688,6 +894,53 @@ class CashFlowModel():
         curve_map = self.rate_curve_groups[curve_group_name].segment_curve_map
         curve_map_dict = curve_map.groupby('segment_type')[['segment_name','curve_id']].apply(lambda x: pd.Series(x.curve_id.values, index=x.segment_name).to_dict()).to_dict()
         return curve_map_dict
+    
+    def return_cohort_strats(self, asofdate, curve_group_name):
+        """
+        calculates aggregated metrics by cohort for a specific cutoff date
+        
+        Parameters
+        =======================================
+        asofdate : date
+            cutoff date to use for the calculation
+        curve_group_name: str, optional
+            the curve type to use
+        """
+        
+        #set high level grouping columns
+        key_cols = ['DealID','BatchKey','BatchAcquisitionDate','AsOfDate']
+        sum_cols = ['OriginationBalance','PurchaseBalance','BOM_PrincipalBalance','InterestBalance',
+                    'TotalPrincipalBalance', 'InterestBearingPrincipalBalance', 'DeferredPrincipalBalance','ScheduledPaymentAmount'
+                ]
+        weight_avg_cols = ['MonthsOnBook', 'RemainingTerm', 'InterestRate','OriginationCreditScore', 'OriginationTerm']
+                
+        group_cols = { #self.account_grouping_cols
+                'key_cols': key_cols,
+                'sum_cols': sum_cols,
+                'weight_avg_cols': weight_avg_cols
+                }
+        
+        rate_curves = self.rate_curve_groups[curve_group_name]
+        
+        summary_metrics = self.data_tape.attach_curve_group(rate_curves, asofdate, group_accounts=True, grouping_cols=group_cols)
+        #add curve ids into table
+        
+        for curve_type in rate_curves.segment_types:
+            #if curve_type in summary_metrics.columns:
+            if curve_type in rate_curves.segments:    
+                #add segments
+                segment_type_recs = rate_curves.segments[curve_type].segment_rules_combined['rule_name_combined'].reset_index(drop=False)
+                segment_type_dict = dict(zip(segment_type_recs['index'], segment_type_recs['rule_name_combined']))
+                summary_metrics[curve_type+'_segment'] = summary_metrics[curve_type+'_segment'].map(segment_type_dict)
+                
+                curve_type_recs = rate_curves.transition_keys.loc[rate_curves.transition_keys['curve_type']==curve_type, ['curve_key', 'curve_id']]
+                curve_type_dict = dict(zip(curve_type_recs['curve_key'], curve_type_recs['curve_id']))
+                summary_metrics[curve_type+'_curve'] = summary_metrics[curve_type].map(curve_type_dict)
+                #drop original curve ids
+                summary_metrics.drop(rate_curves.segment_types, axis=1, errors='ignore', inplace=True)
+                
+        return summary_metrics
+        #return group_cols
         
     def create_curve_stress(self, stress_dict={}):
         """
@@ -747,7 +1000,8 @@ class CashFlowModel():
                 raise Exception('There is more than 1 available Model Configuration. Enter selection for this parameter.')
                         
         #download index projections
-        self.download_index_projections(cutoff_date, index_projection_date)
+        if cutoff_date:
+            self.download_index_projections(cutoff_date, index_projection_date)
                 
         model_params = [cutoff_date, curve_group, curve_stress, index_projection_date, model_config]
         
@@ -756,7 +1010,7 @@ class CashFlowModel():
             self.save_model(scenario_name)
         print('CF Scenario Created\n    Scenario Name: {}\n    Curve Group: {}\n    Cutoff Date: {}\n'.format(scenario_name, curve_group, cutoff_date))
         
-    def download_cf_scenario(self, model_name, uw_month=None, scenario_list=[], update_curve_map=True, refresh=False, lock_curve_group=False, save_scenario=True):
+    def download_cf_scenario(self, model_name, uw_month=None, scenario_list=[], update_curve_map=True, refresh_date=None, lock_curve_group=False, save_scenario=True):
         """
         Downloads a cash flow scenario configuration stored in the server. 
         Includes curve sets and segment definitions
@@ -773,9 +1027,9 @@ class CashFlowModel():
             if true, will register the curve group to this new model. 
             Use false when downloading an existing model
             use True when downloading scenarios created in prior models
-        refresh: bool
-            if true will take all assumptions from source model and create
-            a "refresh" scenario with max asofdate
+        refresh_date: date
+            if a refresh date is provided will take all assumptions from source model and create
+            a scenario with updated asofdate
         """
         
         #if no UW was provided use most recent
@@ -800,14 +1054,16 @@ class CashFlowModel():
             uw_month = model_attr['uw_month']
              
         if self.uw_type=='template' or not uw_month:
-            uw_month = ''
+            uw_month_filter = ''
         else:
-            uw_month = " and uw_month='" + str(uw_month) + "'"
+            uw_month_filter = " and uw_month='" + str(uw_month) + "'"
         
         scenario_list = ", ".join(["'{}'".format(value) for value in scenario_list])
         
         if scenario_list:
             scenario_list = ' and scenario_name in ({})'.format(scenario_list)
+        elif refresh_date is not None:
+            scenario_list = ' and scenario_loaded=1'
         
         sql = """
                 select model_key
@@ -836,7 +1092,7 @@ class CashFlowModel():
             		and model_name='{}'
                     {}
             		{}
-                """.format(model_name, uw_month, scenario_list)
+                """.format(model_name, uw_month_filter, scenario_list)
         
         model_attr = self.sql_engine_model.execute(sql, output=True)
         
@@ -852,7 +1108,7 @@ class CashFlowModel():
             else:
                 curve_group_attr = model_attr[model_attr['curve_group_key']==key].iloc[0].squeeze()
                 self.create_curve_group(curve_group_attr['curve_group_name'], int(key))
-                self.import_rate_curves_sql(curve_group_attr['curve_group_name'], None, curve_group_attr['model_name'], curve_group_attr['scenario_name'], curve_type='all', curve_sub_type='all', update_curve_map=update_curve_map)
+                self.import_rate_curves_sql(curve_group_attr['curve_group_name'], None, curve_group_attr['model_name'], int(curve_group_attr['uw_month']), curve_group_attr['scenario_name'], curve_type='all', curve_sub_type='all', update_curve_map=update_curve_map)
                 download_key_dict[key]=curve_group_attr['curve_group_name']
                 if lock_curve_group:
                     self.rate_curve_groups[curve_group_attr['curve_group_name']].lock_curve_group()
@@ -867,10 +1123,14 @@ class CashFlowModel():
         #create scenarios
         for ix, row in model_attr.iterrows():
             scenario_name = row['scenario_name']
-            if refresh and row['scenario_name']!='Backtest':
-                cutoff_date = 'max' 
+            if refresh_date is not None and row['scenario_name']!='Backtest':
+                #cutoff_date = 'max' 
+                new_cutoff_date = refresh_date
+                old_cutoff_date = row['cutoff_dt']
             else:
-                cutoff_date = str(row['cutoff_dt'])
+                new_cutoff_date = row['cutoff_dt']
+                if new_cutoff_date:
+                    new_cutoff_date = str(new_cutoff_date)
             #scenario_type = row['scenario_type']
             index_proj_date = row['index_proj_dt']
             curve_group_key = row['curve_group_key']
@@ -880,11 +1140,25 @@ class CashFlowModel():
                 curve_stress = json.loads(row['curve_stress'])
                 #convert list of lists into tuples
                 curve_stress = {k:[tuple(i) for i in v] for (k, v) in curve_stress.items()}
+                
+                #if a refresh shift the stress forward
+                if refresh_date is not None:
+                    #for key, value in loaded_model.cf_scenarios.items():
+                    #unpack parameters
+                    #old_cutoff, curve_group_name, curve_stress, index_proj_date, model_config = value[0]
+                    if old_cutoff_date.lower() != 'backtest':
+                        #calculate number of months since RUW
+                        new_cutoff = refresh_date.strftime("%Y-%m-%d")
+                        old_cutoff_format = date.datetime.strptime(old_cutoff_date, '%Y-%m-%d').date()
+                        num_months = (new_cutoff.year - old_cutoff_format.year) * 12 + (new_cutoff.month - old_cutoff_format.month)
+                        #shift stress if exists
+                        stress_object = self.create_curve_stress(curve_stress)
+                        curve_stress = stress_object.shift_stress(num_months)                
             else:
                 curve_stress = None
             model_config = row['config_name']
             
-            self.create_cf_scenario(scenario_name, cutoff_date, curve_group_name, curve_stress, index_proj_date, model_config, save_scenario=save_scenario)
+            self.create_cf_scenario(scenario_name, new_cutoff_date, curve_group_name, curve_stress, index_proj_date, model_config, save_scenario=save_scenario)
     
     def download_model_template(self):
         """
@@ -895,9 +1169,9 @@ class CashFlowModel():
         This method will not automatically create scenarios. Just download the building blocks
         """
         
-        self.download_cf_scenario(self.model_template_name, scenario_list=['Base Case'], update_curve_map=False, refresh=True, lock_curve_group=True)
+        self.download_cf_scenario(self.model_template_name, scenario_list=['Base Case'], update_curve_map=False, refresh_date=None, lock_curve_group=True)
         
-    def run_cash_flows(self, scenarios=[], del_detail_on_complete=True):
+    def run_cash_flows(self, scenarios=[], del_detail_on_complete=True, auto_run=True):
         """
         Runs cash flow scenarios and generates output evaluation.
         
@@ -907,65 +1181,91 @@ class CashFlowModel():
             optional list of scenario names. if left blank will run all scenarios
         """
         
-        for model in self.cf_scenarios.keys():
-            if len(scenarios)==0 or model in scenarios:
+        #rerun actual output if a single account was run prior
+        if self.eval.single_account==True:
+            self.eval.single_account=False
+            self.eval.output_actuals(self.data_tape)
+        
+        if len(scenarios)==0:
+            scenarios = list(self.cf_scenarios.keys())
+        
+        
+        #for model in self.cf_scenarios.keys():
+        #if len(scenarios)==0 or model in scenarios:
+        for model in scenarios:    
+            if model not in self.cf_scenarios:
+                print(f'\r{model} - Failed to Initialize')
+                print(f'     There is no scenario called "{model}"')
+                print('     Validate scenarios name and try again')
+                continue
+            
+            print(f'{model} - Initializing Model', end='\r')
+            #create model object
+            model_params = self.cf_scenarios[model][0]
+            cutoff_date, curve_group_name, curve_stress, index_projection_date, config_name = self.cf_scenarios[model][0]
+            rate_curves = self.rate_curve_groups[curve_group_name]
+            config_dict = self.model_configs[config_name].config_dict
+            model_type = self.model_configs[config_name].config_type
+            
+            
+            if not any(curve in rate_curves.curve_type_info for curve in ['default','prepay', 'rollrate']):
+                print('f\r{model} - Failed to Initialize')
+                print('     Curve Group must contain CDR/CPR or Roll Rate Curves')
+                print('     Add the needed curves and try again')
+                # on this exception skip to next iteration
+                continue
                 
-                print(f'{model} - Initializing Model', end='\r')
-                #create model object
-                model_params = self.cf_scenarios[model][0]
-                cutoff_date, curve_group_name, curve_stress, index_projection_date, config_name = self.cf_scenarios[model][0]
-                rate_curves = self.rate_curve_groups[curve_group_name]
-                config_dict = self.model_configs[config_name].config_dict
-                model_type = self.model_configs[config_name].config_type
+            if curve_stress:
+                scenario_stress = self.create_curve_stress(curve_stress)
+            else:
+                scenario_stress = None
                 
-                if curve_stress:
-                    scenario_stress = self.create_curve_stress(curve_stress)
-                else:
-                    scenario_stress = None
-                    
-                #set cutoff date for max or min
-                if cutoff_date=='max':
-                    cutoff_date = self.data_tape.max_date
-                elif cutoff_date=='min':
-                    cutoff_date = self.data_tape.min_date
-                else:
-                    cutoff_date = cutoff_date
-                    
-                #remove existing model object
-                self.cf_scenarios[model] = None
-                self.cf_scenarios[model]=(model_params, None)
-                gc.collect()
+            #set cutoff date for max or min
+            if cutoff_date=='max':
+                cutoff_date = self.data_tape.max_date
+            elif cutoff_date=='min':
+                cutoff_date = self.data_tape.min_date
+            else:
+                cutoff_date = cutoff_date
                 
-                #add index projections
-                #self.download_index_projections(cutoff_date, index_projection_date)
-                index_rates_df = self.data_prep.index_projections[(index_projection_date,cutoff_date)].data_rate_curves
-                rate_curves.add_curve(index_rates_df, 'index', 'base', 'Calendar', 'Rate Projections Table')
-                with self.suppress_stdout():
-                    self.create_segment(use_gui=False, curve_group_name=curve_group_name, segment_type='index', InterestRateIndex=[])
-                    rate_curves.create_account_map()
-                    
-                #set account id to none
-                config_dict['account_id']=None
+            #remove existing model object
+            self.cf_scenarios[model] = None
+            self.cf_scenarios[model]=(model_params, None)
+            gc.collect()
+            
+            #add index projections
+            #self.download_index_projections(cutoff_date, index_projection_date)
+            index_rates_df = self.data_prep.index_projections[(index_projection_date,cutoff_date)].data_rate_curves
+            rate_curves.add_curve(index_rates_df, 'index', 'base', 'Calendar', 'Rate Projections Table')
+            with self.suppress_stdout():
+                self.create_segment(use_gui=False, curve_group_name=curve_group_name, segment_type='index', InterestRateIndex=[])
+                rate_curves.create_account_map()
                 
-                #save model configuration
-                self.save_model(model)
-                
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    new_model = self.model_builder.build_new_model(model, model_type, self.data_tape, rate_curves, cutoff_date, scenario_stress, config_dict)
-                    self.cf_scenarios[model]=(model_params, new_model)
+            #set account id to none
+            config_dict['account_id']=None
+            
+            #save model configuration
+            self.save_model(model)
+            
+            with np.errstate(divide='ignore', invalid='ignore'):
+                new_model = self.model_builder.build_new_model(model, model_type, self.data_tape, rate_curves, cutoff_date, scenario_stress, config_dict)
+                self.cf_scenarios[model]=(model_params, new_model)
+                if auto_run:
                     self.cf_scenarios[model][1].run_model()
-                    
-                print(f'\r{model} - Evaluating Output', end='\r')
-                self.eval.output_proj_all(model)
                 
-                if del_detail_on_complete:
-                    del self.cf_scenarios[model][1]._cf_data
-                    del self.cf_scenarios[model][1]._model_config
-                gc.collect()
+                    print(f'\r{model} - Evaluating Output', end='\r')
+                    self.eval.output_proj_all(model)
+            
+            if del_detail_on_complete:
+                del self.cf_scenarios[model][1]._cf_data
+                del self.cf_scenarios[model][1]._model_config
+            gc.collect()
+            
+            print(f'\r{model} - Complete            ')
+        
+            
                 
-                print(f'\r{model} - Complete            ')
-                
-    def run_single_account(self, scenario, account_id):
+    def run_single_account(self, scenario, account_id, auto_run=True):
         """
         Runs a single account through a model scenario for QA/validation purposes
 
@@ -1017,11 +1317,12 @@ class CashFlowModel():
         with np.errstate(divide='ignore', invalid='ignore'):
             new_model = self.model_builder.build_new_model(scenario, model_type, self.data_tape, rate_curves, cutoff_date, scenario_stress, config_dict)
             self.cf_scenarios[scenario]=(model_params, new_model)
-            self.cf_scenarios[scenario][1].run_model()
+            if auto_run:
+                self.cf_scenarios[scenario][1].run_model()
             
-        print(f'\r{scenario} - {account_id} - Evaluating Output', end='\r')
-        self.eval.output_actuals(self.data_tape, account_id=account_id)
-        self.eval.output_proj_all(scenario)
+                print(f'\r{scenario} - {account_id} - Evaluating Output', end='\r')
+                self.eval.output_actuals(self.data_tape, account_id=account_id)
+                self.eval.output_proj_all(scenario)
         
         #if del_detail_on_complete:
         #    del self.cf_scenarios[scenario][1]._cf_data
@@ -1094,6 +1395,27 @@ class CashFlowModel():
         return segment_config
     """
     #def generate_curves_json(self):
+        
+    def set_final_scenario(self, scenario):
+        """
+        Tags a sceanrio as final. This is the scenario that will be loaded to finance and ops once an underwrite is complete
+
+        Parameters
+        ----------
+        scenario : str
+            name of the scenario to be locked.
+
+        """
+        #check that scenario exists
+        if scenario not in self.cf_scenarios:
+            print(f'"{scenario}" is not an existing scenario. Check the scenario names and try again')
+            return
+        
+        sql_cmd = "exec fra.cf_model.usp_set_final_scenario ?, ?, ?"
+        params = [int(self.model_id), int(self.uw_id), scenario]
+        self.sql_engine_model.execute(sql_cmd, params)
+        
+        print(f'"{scenario}" successfully set as final scenario')
         
         
     def save_model(self, scenario):

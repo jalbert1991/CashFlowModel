@@ -81,9 +81,16 @@ def make_sidebar_item(item_name):
         ], )
 
 sidebar_sections = ['Model Info', 'Data Tape', 'Curve Groups', 'Model Config', 'Scenarios']
-sidebar_accordion = html.Div([make_sidebar_item(x) for x in sidebar_sections], 
-                                id={'type':'sidebar-sections',
-                                    'index':ALL})
+sidebar_accordion = html.Div(
+    [
+        make_sidebar_item('Model Info'),
+        make_sidebar_item('Data Tape'),
+        make_sidebar_item('Curve Group'),
+        make_sidebar_item('Model Config'),
+        make_sidebar_item('Scenarios'),
+    ], 
+        id={'id':'sidebar-sections'},
+        )
 
 sidebar = html.Div(
     [
@@ -109,7 +116,7 @@ sidebar = html.Div(
         #        ], color="secondary"),
         #    dbc.ListGroupItem("3) Curve Groups", color="secondary", id='sidebar-curve-groups'),
         #    ]),
-        #sidebar_accordion,
+        sidebar_accordion,
     ],
     style={
         "position": "fixed",
@@ -148,6 +155,7 @@ def display_page(pathname):
     else:
         return home.layout
 
+"""
 ##########################################
 #              Sidebar Accordion
 @app.callback(#[Output(f"sidebar-collapse-{x}", "is_open") for x in sidebar_sections],
@@ -166,7 +174,7 @@ def sidebar_accordian_toggle(*args):
     #    [False for x in ]
     
     #component_names = item.component_id for item in 
-
+"""
 
 ##########################################
 #           New Model Tabs 

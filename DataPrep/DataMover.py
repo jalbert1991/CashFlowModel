@@ -47,7 +47,7 @@ class SQLEngine(object):
         
     def execute(self, sql_cmd, parameters=[], output=False):
         
-        sql_cmd = 'set nocount on; ' + sql_cmd
+        sql_cmd = 'set LOCK_TIMEOUT 120000; set nocount on; ' + sql_cmd
         
         result_list=[]
         
@@ -225,25 +225,39 @@ class DataPrep(object):
         
         self.index_projections[(projection_date, cutoff_date)] = IndexProjection(projections, projection_date, cutoff_date)
         
-    def import_data_tape_cdw(self, deal_ids=[], batch_keys=[], asset_class=None, model_name=None):
+    def import_data_tape_cdw(self, deal_ids=[], batch_keys=[], asset_class=None, asofdate=None):
         """
         Extracts snapshot data from the CDW. This is the "Current" data to project forward plus any historical data available.
         
         Parameters
         =================
-        batch_ids: list of int(s)
+        deal_ids: list of int(s)
+            ids that correspond to deals in edw_prod.cdw.batch
+        batch_keys: list of int(s)
             ids for specific batches in edw_prod.cdw.batch
+        asset_class: str (optional)
+            if provided, will download one record for each account within an asset class. 
+            useful for creating/testing asset class assumptions or template models
+        asofdate: date (optional)
+            if provided will only extract this specific date from the data warehouse. 
+            useful if just doing a refresh and a full historical pull is not necessary
         """
         
         deal_lst = ",".join([str(x) for x in deal_ids])
         batch_lst = ",".join([str(x) for x in batch_keys])
         
-        sql_cmd = "exec fra.cf_model.usp_extract_snapshot_v2 ?, ?, ?"
-        params = [deal_lst, batch_lst, asset_class]
+        sql_cmd = "exec fra.cf_model.usp_extract_snapshot_v2 ?, ?, ?, ?, ?"
+        params = [deal_lst, batch_lst, asset_class, asofdate, asofdate]
         
-        sql_tape = self.sql_engine_import.execute(sql_cmd, params, output=True)
+        try:
+            sql_tape = self.sql_engine_import.execute(sql_cmd, params, output=True)
+            return DataTape(sql_tape)
+        except Exception:
+            print("SQL server is busy. Query did not complete after 5 minutes. Data Tape was not downloaded. Try again later.")
+            return
+            
         #self.data_tape = DataTape(sql_tape) #, cutoff_date)
-        return DataTape(sql_tape)
+        
 
     def import_data_tape_query(self, query): #cutoff_date=None
         """
@@ -306,7 +320,7 @@ class DataPrep(object):
         #self.prior_uw_projections = self.sql_engine_import.execute(sql_cmd, params, output=True)
         return self.sql_engine_import.execute(sql_cmd, params, output=True)
         
-    def import_rate_curves_sql(self, curve_group, source_curve_group_name=None, model_name=None, scenario_name=None, curve_type='all', curve_sub_type='all', update_curve_map=True):
+    def import_rate_curves_sql(self, curve_group, source_curve_group_name=None, model_name=None, uw_month=None, scenario_name=None, curve_type='all', curve_sub_type='all', update_curve_map=True):
         """
         Load Curves from SQL Server
         
@@ -333,8 +347,8 @@ class DataPrep(object):
         print(('Downloading Curve Data - {} - {}').format(model_name, scenario_name))
         
         #import data
-        sql_cmd = "exec fra.cf_model.usp_extract_curves ?, ?, ?, ?, ?, ?, ?"
-        params = [curve_group.curve_group_key, source_curve_group_name, model_name, scenario_name, curve_type, curve_sub_type, int(update_curve_map)]
+        sql_cmd = "exec fra.cf_model.usp_extract_curves ?, ?, ?, ?, ?, ?, ?, ?"
+        params = [curve_group.curve_group_key, source_curve_group_name, model_name, uw_month, scenario_name, curve_type, curve_sub_type, int(update_curve_map)]
 
         curve_info, curve_data, segment_input, segment_map = self.sql_engine_import.execute(sql_cmd, params, output=True)
         curve_data.set_index(['curve_type', 'curve_sub_type', 'curve_id', 'from_status', 'to_status', 'period'], inplace=True)
@@ -483,6 +497,7 @@ class DataPrep(object):
             dict containing model config parameters
         """
         
+
         sql_cmd='exec fra.cf_model.usp_upload_model_config ?, ?, ?'
         params=[model_config_name, config_type, json.dumps(config_dict)]
         config_id = self.sql_engine_import.execute(sql_cmd, params, output=True).iloc[0][0]
@@ -531,7 +546,8 @@ class DataTape(object):
     Class to store the monthly data and make any modifications necessary for input into model
     """
     def __init__(self, raw_tape):
-        self.raw_tape = raw_tape
+        self.raw_tape = raw_tape.apply(pd.to_numeric, errors='ignore')
+        #self.raw_tape = raw_tape
         self.min_date = raw_tape['AsOfDate'].min().strftime('%Y-%m-%d')
         self.max_date = raw_tape[raw_tape['BOM_PrincipalBalance']>0]['AsOfDate'].max().strftime('%Y-%m-%d')
         self.cutoff_date = self.max_date #raw_tape['AsOfDate'].max().strftime('%Y-%m-%d')
@@ -580,7 +596,7 @@ class DataTape(object):
         self.cutoff_tape = self.raw_tape.loc[self.cutoff_ix].copy()
 
 
-    def attach_curve_group(self, rate_curves, cutoff_date, group_accounts=True, account_id=None):
+    def attach_curve_group(self, rate_curves, cutoff_date, group_accounts=True, account_id=None, grouping_cols = None):
         """
         Attaches a curve set onto data tape and aggregates to grouping level
         
@@ -606,12 +622,15 @@ class DataTape(object):
         
         #isolate curve map from cutoff index
         cutoff_map = rate_curves.curve_account_map.loc[self.cutoff_ix.values]
-        
         self.cutoff_tape = pd.merge(self.cutoff_tape.set_index('AccountKey'), cutoff_map, left_index=True, right_index=True, sort=True) #data tape input
-        input_tape = self.set_account_groups(group_accounts)
+        #isolate segment map from cutoff index
+        segment_map = rate_curves.segment_account_map.loc[self.cutoff_ix.values].copy()
+        self.cutoff_tape = pd.merge(self.cutoff_tape, segment_map.drop(['AsOfDate', 'BatchKey', 'segment_group_id'], axis=1, errors='ignore'), left_index=True, right_index=True, sort=True, suffixes=(None, '_segment'))
+        
+        input_tape = self.set_account_groups(group_accounts, grouping_cols)
         return input_tape
         
-    def set_account_groups(self, group_accounts=False):
+    def set_account_groups(self, group_accounts=False, grouping_cols=None):
         """
         Returns a cutoff data tape at the specified grouping level.
         Option to group accounts on key static attributes and 
@@ -621,7 +640,8 @@ class DataTape(object):
         =======================================
         group_accounts : bool, optional
             if true, will group accounts to reduce model run time. The default is False.
-
+        grouping_cols : Dict of lists
+            dictionary of lists describing which columns to include and how to group them
         Returns
         ====================
         DataFrame
@@ -634,8 +654,10 @@ class DataTape(object):
             data_tape['rec_cnt'] = 1
         
         else:
-            #if grouping rules not provided create default
-            if not self.account_grouping_cols:
+            #if grouping rules not provided create default setting
+            if grouping_cols:
+                self.account_grouping_cols = grouping_cols
+            else:
                 
                 key_cols = ['DealID','BatchKey','BatchAcquisitionDate','AsOfDate','MonthsOnBook','RemainingTerm','MonthsToAcquisition',
                             'InterestRateType','InterestRateIndex','InterestRateChangeFrequency',
@@ -649,7 +671,7 @@ class DataTape(object):
                         ]
                 weight_avg_cols = ['InterestRate','InterestMargin','OriginationCreditScore']
                 
-                self.account_grouping_cols = {
+                self.account_grouping_cols = { #self.account_grouping_cols
                         'key_cols': key_cols,
                         'sum_cols': sum_cols,
                         'weight_avg_cols': weight_avg_cols
@@ -663,13 +685,13 @@ class DataTape(object):
 
             #add and segment colums found
             for col in data_tape.columns:
-                if col in self.rate_curves.segment_types and col not in key_cols:
+                if col.split('_',1)[0] in self.rate_curves.segment_types and col not in key_cols:
                     self.account_grouping_cols['key_cols'].extend([col])
                     
             #self._model_config['acct_grouping_cols']['key_cols']=key_cols
             tape_grouped = data_tape.groupby(self.account_grouping_cols['key_cols'], dropna=False).apply(self.assign_agg_functions)
-            return tape_grouped.reset_index()
-        
+            return tape_grouped.reset_index()       
+      
     def assign_agg_functions(self, x):
         
         agg_dict = {}
@@ -755,7 +777,11 @@ class CurveGroup(object):
         unique_id = self.curves[(curve_type, curve_sub_type)].data_rate_curves.index.unique(level='curve_id')
         if len(unique_id)==1:
             self.add_segment(curve_type)
-        
+            #add curve id to manual map with "all" segment
+            #curve_id = self.curves[(curve_type, curve_sub_type)].curve_ids['curve_id'].loc[0]
+            #curve_id = self.curve_keys[self.curve_keys['curve_type']==curve_type]['curve_id'].loc[0]
+            self.segment_map_manual[curve_type] = {unique_id[0] : 'all'}
+            
     def update_curve_keys(self, curve_type):
         
         #curve_ids=[]
@@ -892,13 +918,14 @@ class CurveGroup(object):
         output_df['curve_key'] = output_df['curve_id'].map(curve_key_dict) #curve_name
         #map segment keys
         segment_keys = self.segments[segment_type].segment_rules_combined['rule_name_combined'].reset_index().set_index('rule_name_combined')
+        
         output_df['segment_key'] = output_df['segment_name'].map(segment_keys['index'])
         
         #delete exising entries and load new map
         curve_index = self.segment_curve_map[self.segment_curve_map['segment_type']==segment_type].index
         self.segment_curve_map.drop(curve_index, inplace=True, errors='ignore')
         self.segment_curve_map = self.segment_curve_map.append(output_df, ignore_index=True)
-            
+        
     
     def return_transition_matrix_old(self):
         """
@@ -996,7 +1023,7 @@ class CurveGroup(object):
         
         #create empty matrix
         #rr_matrix = np.full(shape=[len(rr_segments), self.data_tape.num_status, self.data_tape.num_status], fill_value=-1, dtype=int)
-        rr_matrix = np.zeros(shape=[len(rr_segments), self.data_tape.num_status, self.data_tape.num_status, len(rate_dict[-1])], dtype=np.float32)
+        rr_matrix = np.zeros(shape=[len(rr_keys), self.data_tape.num_status, self.data_tape.num_status, len(rate_dict[-1])], dtype=np.float32)
         #populate matrix with transition ids
         rr_segment_index = rr_segments.reset_index(drop=False)[['rollrate', 'from_status','to_status']].values.astype(int)
         rr_matrix[rr_segment_index[:,0], rr_segment_index[:,1], rr_segment_index[:,2]] = np.array(rr_segments['rate'].to_list())
@@ -1097,6 +1124,7 @@ class CurveGroup(object):
         defaults['ProjectionMonth'] = defaults.apply(lambda row: self.time_dif_months(row['cutoff_date'], row['AsOfDate']), axis=1) * -1
         
         return defaults[['BatchKey','AsOfDate','recovery_curve','ProjectionMonth','ChargeOffAmount']].set_index(['AsOfDate', 'BatchKey','recovery_curve']).sort_index()
+        #return defaults
         
     def time_dif_months(self, date_1, date_2):
         
@@ -1384,6 +1412,8 @@ class CurveGroup(object):
         #x.reset_index(level=['curve_type', 'curve_key'], drop=True, inplace=True)
         x.reset_index(level=['transition_key'], drop=True, inplace=True)
         return x.reindex(idx, fill_value=0)
+        
+        
     
 class CurveSet(object):
     
@@ -1572,6 +1602,9 @@ class SegmentSet(object):
         cross_df['rule_eval_combined'] = cross_df[rule_name_cols].apply(lambda row: np.logical_and.reduce([i for i in row.values]), axis=1)
         cross_df.drop(columns=rule_name_cols, inplace=True)
         
+        #clear prior entries
+        #self.segment_rules_combined.drop(self.segment_rules_combined.index, inplace=True)
+        self.segment_rules_combined = self.segment_rules_combined[0:0]
         #add rules onto master list to generate unique index
         cross_df.index = cross_df.index + int(np.nan_to_num(self.segment_rules_combined.index.max()))+1
         self.segment_rules_combined = pd.concat([self.segment_rules_combined, cross_df])
@@ -1746,6 +1779,32 @@ class CurveStress(object):
                 output_arrays[key] = reindex_array+1
             
         return output_arrays
+    
+    def shift_stress(self, num_months):
+        """
+        Shifts stresses by specified number of months. Used for Refreshes where we need to shift 
+        assumptions forward by x number of months
+
+        Parameters
+        ----------
+        num_months : int
+            number of months to shift forward.
+
+        Returns
+        -------
+        dictionary of shifted stress tuples.
+
+        """
+        final_stress_dict = {}
+        
+        for curve_type in self.stress_df:
+    
+            stress_dict = self.stress_df[curve_type].reset_index()
+            stress_dict['period'] -= num_months
+            stress_list = list(stress_dict.iloc[num_months:].set_index('period').to_records())
+            final_stress_dict[curve_type] = stress_list
+        
+        return final_stress_dict
         
 class IndexProjection(object):
     """

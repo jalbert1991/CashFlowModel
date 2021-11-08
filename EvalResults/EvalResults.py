@@ -12,6 +12,7 @@ import pathlib
 import io
 import openpyxl as xl
 import sys
+import time
 
 import importlib.resources as pkg_resources
 import tempfile
@@ -21,8 +22,9 @@ import Templates as templates
 
 class AVP(object):
     
-    def __init__(self, scenarios):
+    def __init__(self, scenarios, model_details):
         self.scenarios = scenarios
+        self.model_details = model_details
         #self.data_tape = data_tape
         self.single_account=False
         
@@ -94,7 +96,7 @@ class AVP(object):
         self.drop_scenario(scenario_name)
         
         if not metric_list:
-            metric_list = metric_list = ['BOM_PrincipalBalance','InterestBalance', 'TotalPrincipalBalance','ScheduledPaymentAmount', 'ScheduledPaymentMade', 'TotalPaymentMade', 'ContractualPrincipalPayment','InterestPayment','PrincipalPartialPrepayment','PrincipalFullPrepayment', 'PostChargeOffCollections']
+            metric_list = ['BOM_PrincipalBalance','InterestBalance', 'TotalPrincipalBalance','ScheduledPaymentAmount', 'ScheduledPaymentMade', 'TotalPaymentMade', 'ContractualPrincipalPayment','InterestPayment','PrincipalPartialPrepayment','PrincipalFullPrepayment', 'PostChargeOffCollections']
         
         #reset index if needed
         if not pd.RangeIndex(stop=(len(data_tape))).equals(data_tape.index):
@@ -120,7 +122,9 @@ class AVP(object):
         data_tape.set_index('Scenario', append=True, inplace=True)
         
         #group metris to index
-        dt_grouped = data_tape[metric_list].groupby(data_tape.index.names, axis=0).sum()
+        #dt_grouped = data_tape[metric_list].groupby(data_tape.index.names, axis=0).sum()
+        dt_grouped = data_tape[metric_list].fillna(0).sum(level=data_tape.index.names)
+
         
         #reconfigure DF, uppivot metrics into rows, then pivot status into columns
         dt_pivot=pd.melt(dt_grouped.reset_index(), id_vars=dt_grouped.index.names, var_name='Metric')
@@ -143,6 +147,8 @@ class AVP(object):
         # create combined output
         #self.output_combined('Actuals')
         self.output_combined(scenario_name)
+        
+        #return dt_grouped
         
     def output_single_account(self, scenario, account_id):
         """
@@ -183,6 +189,8 @@ class AVP(object):
             scenario name to process
         """
         
+        
+        
         scenario_data = self.scenarios[scenario][1]
         
         self.account_status_list = scenario_data._model_config['account_status_list']
@@ -218,7 +226,7 @@ class AVP(object):
         self.output_combined(scenario)
         
         #recoveries
-        if scenario_data._model_config.get('PostChargeOffCollections'):
+        if 'recovery' in scenario_data._model_config['segment_keys'].keys():
             self.proj_recovery(scenario)
     
     def index_set(self, column, data_tape):
@@ -479,6 +487,13 @@ class AVP(object):
         scenario_final = balance_by_status.append(scenario_final.to_frame()) #, verify_integrity=True)
         scenario_final.sort_index(inplace=True)
         #consolidate additional metrics from model output
+        
+        #create total prepayment
+        total_prepay = scenario_final.loc[idx[:, :, scenario, ['PrincipalFullPrepayment', 'PrincipalPartialPrepayment']], :].groupby(['BatchKey', 'AsOfDate','Scenario']).sum()
+        total_prepay['Metric'] = 'PrincipalTotalPrepayment'
+        total_prepay.set_index('Metric', append=True, inplace=True)
+        scenario_final = scenario_final.append(total_prepay)
+        
         if scenario != 'Actuals':
            
             #scheduled payment made
@@ -490,12 +505,6 @@ class AVP(object):
             #TotalpaymentMade
             scenario_final.sort_index(inplace=True)
             scenario_final.loc[idx[:, :, scenario, 'TotalPaymentMade'], :] = scenario_final.loc[idx[:, :, scenario, ['TotalPaymentMade', 'PrincipalFullPrepayment']], :].groupby(['BatchKey', 'AsOfDate','Scenario']).sum()
-            
-            #total prepayment
-            total_prepay = scenario_final.loc[idx[:, :, scenario, ['PrincipalFullPrepayment', 'PrincipalPartialPrepayment']], :].groupby(['BatchKey', 'AsOfDate','Scenario']).sum()
-            total_prepay['Metric'] = 'PrincipalTotalPrepayment'
-            total_prepay.set_index('Metric', append=True, inplace=True)
-            scenario_final = scenario_final.append(total_prepay)
             
             #gross cash
             gross_cash = scenario_final.loc[idx[:, :, scenario, ['TotalPaymentMade', 'PrincipalFullPrepayment', 'PostChargeOffCollections']], :].groupby(['BatchKey', 'AsOfDate','Scenario']).sum()
@@ -587,7 +596,7 @@ class AVP(object):
         """
         if len(batch_keys)>0:
             batch_array = self.cf_output.index.get_level_values('BatchKey').values 
-            batch_mask = np.in1d(batch_array, [504, 522])
+            batch_mask = np.in1d(batch_array, batch_keys)
             avp_data = self.cf_output[batch_mask].copy()
         else:
             avp_data = self.cf_output.copy()
@@ -599,29 +608,62 @@ class AVP(object):
         with avp_path as path:
             avp_workbook = xl.load_workbook(path.resolve())
             
+            #add in model/scenario information
+            ws = avp_workbook['Model Details']
+            row = 6
+            for i, value in enumerate(self.scenarios.keys()):
+                ws.cell(column=5, row=row+i, value=value)
+                
+            #unpack model details
+            (model_name, model_id, deal_ids, batch_keys, uw_type, uw_month) = self.model_details
+            ws['C3'] = model_name
+            ws['C4'] = model_id
+            ws['C5'] = ",".join([str(element) for element in deal_ids])
+            ws['C6'] = ",".join([str(element) for element in batch_keys])
+            ws['C7'] = uw_type
+            ws['C8'] = uw_month
+            
+            
+            #write data frame into data tab
+            from openpyxl.utils.dataframe import dataframe_to_rows
+            ws = avp_workbook['Data']
+            for r in dataframe_to_rows(avp_data.reset_index(), index=False, header=False):
+                ws.append(r)
+                          
+            
         #save_path = io.BytesIO(xl.writer.excel.save_virtual_workbook(avp_workbook))
         #save_path = os.path.join(sys.path[0], '\Documents\AvP.xlsx')
         
         save_path = tempfile.NamedTemporaryFile(suffix='.xlsx', dir=self.temp_folder, delete=False) 
         self.temp_files.append(save_path)
         
+        avp_workbook.save(save_path)
+        
+        """
         #create writer to add data to workbook
-        with pd.ExcelWriter(save_path.name, engine='openpyxl') as writer:
+        #options = {}
+        #options['strings_to_formulas'] = False
+        #options['strings_to_urls'] = False
+        with pd.ExcelWriter(save_path.name, engine='openpyxl') as writer: #openpyxl engine='xlsxwriter'
             # Save workbook as base (ensures all tabs are included)
             writer.book = avp_workbook
             writer.sheets = dict((ws.title, ws) for ws in avp_workbook.worksheets)
-        
+            
             # copy data into workbook
             avp_data.reset_index().to_excel(writer,'Data', index = False)
-        
+            
             # Save and close the file
             writer.save()
-            writer.close()
-            try:
-                avp_workbook.close()
-            except:
-                pass
+            #writer.close()
+            #time.sleep(5)
             
+            #try:
+            #    avp_workbook.close()
+            #except Exception:
+            #    pass
+        """
+        
+           
         #open the workbook
         #os.startfile(save_path.read())
         #with save_path as f:

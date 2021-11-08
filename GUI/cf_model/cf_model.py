@@ -6,7 +6,7 @@ Created on Wed Nov 18 21:17:40 2020
 """
 
 import DataPrep.DataMover as DataPrep
-import CashFlowModelMainV2 as cf_main
+import CashFlowModelMain as cf_main
 
 #create data prep instance to import base lookup data
 sql_engine = DataPrep.SQLEngine()

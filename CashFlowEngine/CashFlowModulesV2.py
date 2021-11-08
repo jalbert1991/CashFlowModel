@@ -7,7 +7,7 @@ Created on Sun Jan 19 10:01:37 2020
 
 import pandas as pd
 import numpy as np
-#import numpy_financial as npf
+import numpy_financial as npf
 import datetime as date
 from dateutil import relativedelta
 import re
@@ -68,7 +68,7 @@ class CashFlowEngine(object):
         self._model_config['segment_keys'] = {}
         self.process_raw_tape()
         
-        self._model_config['projection_periods']=int(max(self.cf_input_data['RemainingTerm']))
+        self._model_config['projection_periods']=int(min(max(self.cf_input_data['RemainingTerm']), max(self.cf_input_data['OriginationTerm'])))
         
         #add placeholders if not imported
         self._model_config['repay_begin_mth'] = self._model_config.get('repay_begin_mth',0) #for accounts not yet in repay (deferment or FF where account not yet purchased)
@@ -84,7 +84,7 @@ class CashFlowEngine(object):
         
         self._cf_metrics = ['AsOfDate','month_of_year','MonthsOnBook','RemainingTerm', 'MonthsToAcquisition', 'CalendarMonth',
                           'bom_final_trans','eom_final_trans','BOM_PrincipalBalance','bom_int','bom_units',
-                          'upb_trans', 'upb_trans_agg','int_trans', 'int_trans_agg','units_trans','TotalPrincipalBalance','InterestBalance','eom_units','InterestRate',
+                          'upb_trans', 'upb_trans_agg','int_trans', 'int_trans_agg','units_trans','TotalPrincipalBalance','InterestBalance','eom_units','InterestRate', 'int_rate_calc', 'rate_change_trigger',
                           'int_accrue', 'ScheduledPaymentCalc', 'ScheduledPaymentAmount','amort_rule_used' , 'sch_pmt_trans', 'TotalPaymentMade','InterestPayment','ContractualPrincipalPayment',
                           'PrincipalPartialPrepayment', 'curtail_calc', 'int_cap', 'PostChargeOffCollections']
                             #,'cur_trans_rates'
@@ -590,7 +590,8 @@ class CalcRateCurves(CashFlowBaseModule):
                     array_length = self.cf_model_data['rate_arrays'][key].shape
                     stress_array = self._mediator._model_config['curve_stress'].return_stress_array([key], array_length[1])
                     self.cf_model_data['stress_arrays'] = {**self.cf_model_data['stress_arrays'], **stress_array}
-                        
+                    
+            """
             ####################################################
             #Apply stress curves
             
@@ -633,10 +634,81 @@ class CalcRateCurves(CashFlowBaseModule):
             variance_alloc = np.multiply(non_fwd_roll_scale, rr_variance[:, :, np.newaxis, :])
             np.subtract(self.cf_model_data['rate_arrays']['rollrate'], variance_alloc, out=self.cf_model_data['rate_arrays']['rollrate'])
             np.around(self.cf_model_data['rate_arrays']['rollrate'], decimals=6, out=self.cf_model_data['rate_arrays']['rollrate'])
-                        
+        """
             
         ###################### initialize first month rates #############################
         self.run_module()     
+    
+    def create_rr_mask(self):
+        default_mask = np.zeros(shape=[self.cf_input_data['num_status'],self.cf_input_data['num_status']], dtype=bool)
+        #forward rolls only
+        from_adjust = np.array([1,2,3,4,5,6], dtype=int)
+        to_adjust = np.array([2,3,4,5,6,7], dtype=int)
+        default_mask[from_adjust, to_adjust]=1
+        default_mask[:, 8] = 1
+        
+        #prepay mask
+        prepay_mask = np.zeros(shape=[self.cf_input_data['num_status'],self.cf_input_data['num_status']], dtype=bool)
+        prepay_mask[:,12] = 1
+        
+        combined_mask = np.logical_or(default_mask, prepay_mask)
+        
+        return default_mask, prepay_mask, combined_mask
+    
+    def apply_stress_curves(self, projection_month):
+        
+        ####################################################
+        #Apply stress curves
+        
+        #Default mask - apply stress to forward rolls only
+        default_mask = np.zeros(shape=[self.cf_input_data['num_status'],self.cf_input_data['num_status']], dtype=bool)
+        #forward rolls only
+        from_adjust = np.array([1,2,3,4,5,6], dtype=int)
+        to_adjust = np.array([2,3,4,5,6,7], dtype=int)
+        default_mask[from_adjust, to_adjust]=1
+        default_mask[:, 8] = 1
+        
+        #prepay mask
+        prepay_mask = np.zeros(shape=[self.cf_input_data['num_status'],self.cf_input_data['num_status']], dtype=bool)
+        prepay_mask[:,12] = 1
+        
+        combined_mask = np.logical_or(default_mask, prepay_mask)
+        
+        #apply all stress curves available
+        for curve_type, stress in self.cf_model_data['stress_arrays'].items():
+            if curve_type=='default':
+                default_stress = self.cf_model_data['stress_arrays']['default'][projection_month]
+                #apply stress to forward rolls
+                np.multiply(self.cf_model_data['cur_month_rates']['rollrate'][:, :, :], default_stress, where=default_mask[np.newaxis, :, :], out=self.cf_model_data['cur_month_rates']['rollrate'])
+                np.clip(self.cf_model_data['cur_month_rates']['rollrate'], a_min=0.0, a_max=1.0, out=self.cf_model_data['cur_month_rates']['rollrate'])
+                
+            elif curve_type=='prepay':
+                prepay_stress = self.cf_model_data['stress_arrays']['prepay'][projection_month]
+                np.multiply(self.cf_model_data['cur_month_rates']['rollrate'][:, :, :], prepay_stress, where=prepay_mask[np.newaxis, :, :], out=self.cf_model_data['cur_month_rates']['rollrate'])
+                np.clip(self.cf_model_data['cur_month_rates']['rollrate'], a_min=0.0, a_max=1.0, out=self.cf_model_data['cur_month_rates']['rollrate'])
+                
+            else: #curve_type=='curtail':      
+                np.multiply(self.cf_model_data['cur_month_rates'][curve_type], self.cf_model_data['stress_arrays'][curve_type][projection_month], out=self.cf_model_data['cur_month_rates'][curve_type])
+                np.clip(self.cf_model_data['cur_month_rates'][curve_type], a_min=0.0, a_max=1.0, out=self.cf_model_data['cur_month_rates'][curve_type])
+         
+        
+        #Normalize Roll Rates Non-Forward rolls so array ties out to 100%
+        rr_variance = np.sum(self.cf_model_data['cur_month_rates']['rollrate'][:, :, :], axis=2) - 1
+        #tilde (~) is a python operator to invert the input. The combined mask is a boolean array. adding the tilde will invert each value (True -> False, False -> True)
+        non_fwd_roll_total = np.sum(self.cf_model_data['cur_month_rates']['rollrate'][:, :, :], where=~combined_mask[np.newaxis, :, :], axis=2)
+        #calc the % spread among remaining rolls
+        non_fwd_roll_scale = np.divide(self.cf_model_data['cur_month_rates']['rollrate'][:, :, :], non_fwd_roll_total[:, np.newaxis, :], where=~combined_mask[np.newaxis, :, :])
+        #ensure stressed rolls are zeroed out in scale array
+        mask_full = np.broadcast_to(combined_mask, non_fwd_roll_scale.shape)
+        non_fwd_roll_scale = np.where(mask_full, 0, non_fwd_roll_scale)
+        #plug any nans
+        non_fwd_roll_scale = np.nan_to_num(non_fwd_roll_scale)
+        variance_alloc = np.multiply(non_fwd_roll_scale, rr_variance[:, np.newaxis, :])
+        #variance_alloc = np.multiply(non_fwd_roll_total, rr_variance[:, np.newaxis, :])
+        np.subtract(self.cf_model_data['cur_month_rates']['rollrate'], variance_alloc, out=self.cf_model_data['cur_month_rates']['rollrate'])
+        np.around(self.cf_model_data['cur_month_rates']['rollrate'], decimals=6, out=self.cf_model_data['cur_month_rates']['rollrate'])
+        
+        
     
     def get_curve_lookup(self, curve_type):
         """
@@ -675,6 +747,7 @@ class CalcRateCurves(CashFlowBaseModule):
         self.cf_model_data['cur_month_rates']['rollrate'][pre_acq_shift,13,:] = 0 #at acquisition month "from 13" set to zero
         self.cf_model_data['cur_month_rates']['rollrate'][pre_acq_shift,13,1] = 1 #at acquisition month "from 13 to 1" set to 1
             
+        
         if 'eom_final_trans' in self.cf_model_data:
             np.multiply(self.cf_model_data['bom_final_trans'][:,:,np.newaxis], self.cf_model_data['cur_month_rates']['rollrate'], out=self.cf_model_data['eom_final_trans'])
         else:
@@ -697,6 +770,10 @@ class CalcRateCurves(CashFlowBaseModule):
             #print(lookup_array)
             self.cf_model_data['cur_month_rates'][s] = self.cf_model_data['rate_arrays'][s][self.segment_keys[s],lookup_array]
             
+        #############################
+        #apply stress arrays
+        if self._mediator._model_config['curve_stress']:
+            self.apply_stress_curves(self.cf_input_data['CalendarMonth'][0])
         
         
     def run_eom_reset(self):
@@ -792,7 +869,8 @@ class CalcBalance(CashFlowBaseModule):
     
     def run_module(self):
         
-        #get current month transition rates        
+        #get current month transition rates   
+        self.update_cf_inputs()
         #numpy operators to save memory
         np.multiply(self.cf_model_data['BOM_PrincipalBalance'][:,:, np.newaxis], self.cf_input_data['cur_month_rates']['rollrate'], out=self.cf_model_data['upb_trans'])
         np.multiply(self.cf_model_data['bom_int'][:,:, np.newaxis], self.cf_input_data['cur_month_rates']['rollrate'], out=self.cf_model_data['int_trans'])
@@ -833,9 +911,7 @@ class CalcInterest(CashFlowBaseModule):
         super().__init__(mediator)
         
         #initialize fields at T0
-        self._cf_input_fields=['InterestRate','InterestRateType','InterestRateIndex','InterestMargin',
-                                'InterestRateChangeFrequency','MaxInterestRate','MinInterestRate',
-                                'AsOfDate', 'MonthsOnBook', 'cur_month_rates', 'upb_trans_agg']
+        self._cf_input_fields=['AsOfDate', 'MonthsOnBook', 'cur_month_rates', 'upb_trans_agg']
         #'num_status', 'num_cohorts', 'account_status_list'
         self.cf_input_data = self.request_all(self._cf_input_fields)
         self.cf_model_data = {}
@@ -845,11 +921,18 @@ class CalcInterest(CashFlowBaseModule):
             self._compound_type = 'Monthly'
         else:
             self._compound_type = compound_type
-        #self.cf_model_data['InterestRateType'] = self.request_data(1,'InterestRateType')
-        #self.cf_model_data['InterestRateIndex'] = self.request_data(1,'InterestRateIndex')
-        #self.cf_model_data['InterestRateChangeFrequency'] = self.request_data(1,'InterestRateChangeFrequency')
-        self.cf_model_data['InterestRate'] = self.cf_input_data['InterestRate'].astype(np.float32)
-        self.cf_model_data['int_rate_calc'] = np.zeros_like(self.cf_input_data['InterestRate'])
+            
+        self.fixed_rate = self.request_data(1,'InterestRate')
+        
+        self.cf_model_data['InterestRateType'] = self.request_data(1,'InterestRateType')
+        self.cf_model_data['InterestRateIndex'] = self.request_data(1,'InterestRateIndex')
+        self.cf_model_data['InterestMargin'] = self.request_data(1,'InterestMargin')
+        self.cf_model_data['InterestRateChangeFrequency'] = self.request_data(1,'InterestRateChangeFrequency')
+        self.cf_model_data['MaxInterestRate'] = self.request_data(1,'MaxInterestRate')
+        self.cf_model_data['MinInterestRate'] = self.request_data(1,'MinInterestRate')
+        
+        self.cf_model_data['InterestRate'] = self.cf_model_data['InterestMargin'].astype(np.float32)
+        self.cf_model_data['int_rate_calc'] = np.zeros_like(self.cf_model_data['InterestRate'])
         self.cf_model_data['int_accrue'] = np.zeros((self._mediator._model_config['num_cohorts'], self._mediator._model_config['num_status'], self._mediator._model_config['num_status']), dtype='float32')
 
         
@@ -880,15 +963,15 @@ class CalcInterest(CashFlowBaseModule):
     def calc_int_rate(self):
         
         #choose variable or fixed
-        cond_list = [self.cf_input_data['InterestRateType']=='Variable', self.cf_input_data['InterestRateType']=='Fixed'] #self.cf_input_data['MonthsOnBook']<0,
-        choice_list = [self.cf_input_data['InterestMargin'], self.cf_input_data['InterestRate']] #variable should be margin+index #np.zeros((self.cf_input_data['InterestMargin'].shape)) ,
+        cond_list = [self.cf_model_data['InterestRateType']=='Variable', self.cf_model_data['InterestRateType']=='Fixed'] #self.cf_input_data['MonthsOnBook']<0,
+        choice_list = [self.cf_model_data['InterestMargin'], self.fixed_rate] #variable should be margin+index #np.zeros((self.cf_input_data['InterestMargin'].shape)) ,
         rate = np.select(cond_list, choice_list)
         
         #add index
         np.add(rate, self.cf_input_data['cur_month_rates']['index'], out=self.cf_model_data['int_rate_calc'])
         
         #upper and lower bounds
-        np.clip(self.cf_model_data['int_rate_calc'], self.cf_input_data['MinInterestRate'], self.cf_input_data['MaxInterestRate'], out=self.cf_model_data['int_rate_calc'])
+        np.clip(self.cf_model_data['int_rate_calc'], self.cf_model_data['MinInterestRate'], self.cf_model_data['MaxInterestRate'], out=self.cf_model_data['int_rate_calc'])
         
         #compound calculation
         if self._compound_type == 'monthly':
@@ -903,8 +986,8 @@ class CalcInterest(CashFlowBaseModule):
         #if interest change month choose new calc, else keep old value
         #assume MOB is from origination. in that case just modulo on MOB. 
         #mob%3==0
-        rate_change_trigger = self.cf_input_data['MonthsOnBook'] % self.cf_input_data['InterestRateChangeFrequency'] == 0
-        self.cf_model_data['InterestRate'] = np.where(rate_change_trigger, rate, self.cf_model_data['InterestRate'])
+        self.cf_model_data['rate_change_trigger'] = self.cf_input_data['MonthsOnBook'] % self.cf_model_data['InterestRateChangeFrequency'] == 0
+        self.cf_model_data['InterestRate'] = np.where(self.cf_model_data['rate_change_trigger'], rate, self.cf_model_data['InterestRate'])
         
         #self.cf_model_data['InterestRate'] = np.array(rate, dtype='float32')
     
@@ -916,7 +999,7 @@ class CalcInterest(CashFlowBaseModule):
         np.multiply(self.cf_model_data['int_accrue'], self.int_accrue_matrix, out=self.cf_model_data['int_accrue'])
         
     def run_module(self):
-        
+        self.update_cf_inputs()
         self.calc_int_rate()
         self.calc_int_accrued()
         
@@ -977,7 +1060,7 @@ class CalcPayments(CashFlowBaseModule):
             #0:"np.pmt(cf_input_data['InterestRate'][:,np.newaxis], cf_input_data['RemainingTerm'][:,np.newaxis], cf_input_data['BOM_PrincipalBalance'])",
             #1:"np.zeros_like(cf_input_data['BOM_PrincipalBalance'])",
             1:"np.zeros_like(cf_input_data['BOM_PrincipalBalance'])",
-            99:"np.pmt(cf_input_data['InterestRate'][:,np.newaxis], cf_input_data['RemainingTerm'][:,np.newaxis], cf_input_data['BOM_PrincipalBalance'])"
+            99:"npf.pmt(cf_input_data['InterestRate'][:,np.newaxis], cf_input_data['RemainingTerm'][:,np.newaxis], cf_input_data['BOM_PrincipalBalance'])"
         }
         self.amort_timing = {
             #0:"np.isnan(np.sum(cf_model_data['ScheduledPaymentAmount'], axis=1))[:,np.newaxis]", #if scheduled payment is null
@@ -1038,7 +1121,7 @@ class CalcPayments(CashFlowBaseModule):
         if Roll forward = 0% payment
         if Cure = 200% payment
         if Default/Forbearance/BK then 0% payment
-        if prepay then 100% payment (one normal payment, then all remaining principal is prepayment)
+        if prepay then 0% payment (all remaining principal is prepayment)
         """
         #fill diagonals
         #same status = 100% pmt
@@ -1048,7 +1131,7 @@ class CalcPayments(CashFlowBaseModule):
             np.fill_diagonal(self.pmt_matrix[x:8,:], 1.0+x)
         
         #to payoff make one normal payment
-        self.pmt_matrix[:,12]=1
+        self.pmt_matrix[:,12]=0
         #from status zero payment
         self.pmt_matrix[[0,8,11,12,13],:] = 0
         #to status zero payment
@@ -1062,7 +1145,7 @@ class CalcPayments(CashFlowBaseModule):
         
         """
         if ream_type=='monthly':
-            self.amort_formula[99] = "np.pmt(cf_input_data['InterestRate'][:,np.newaxis], cf_input_data['RemainingTerm'][:,np.newaxis], cf_input_data['BOM_PrincipalBalance'])"
+            self.amort_formula[99] = "npf.pmt(cf_input_data['InterestRate'][:,np.newaxis], cf_input_data['RemainingTerm'][:,np.newaxis], cf_input_data['BOM_PrincipalBalance'])"
         elif ream_type =='scale':
             #take the scheduled payment calculated last month and scale down based on roll rates
             self.amort_formula[99] = "cf_model_data['ScheduledPaymentAmount']" 
@@ -1092,7 +1175,7 @@ class CalcPayments(CashFlowBaseModule):
         custom_amort_formula: string
             optional formula for custom amortization function. 
             if blank, will just use standard numpy payment calculation function
-                np.pmt(InterestRate, Remaining Term, UPB)
+                npf.pmt(InterestRate, Remaining Term, UPB)
         """
         #create new rule key
         rule_key = sorted(self.amort_formula.keys())[-2]+1
@@ -1114,7 +1197,7 @@ class CalcPayments(CashFlowBaseModule):
             self.add_cf_input_fields(custom_amort_formula)
             formula = self.format_column_inputs(custom_amort_formula)
         else:
-            formula = "np.pmt(cf_input_data['InterestRate'][:,np.newaxis], cf_input_data['RemainingTerm'][:,np.newaxis], cf_input_data['BOM_PrincipalBalance'])"
+            formula = "npf.pmt(cf_input_data['InterestRate'][:,np.newaxis], cf_input_data['RemainingTerm'][:,np.newaxis], cf_input_data['BOM_PrincipalBalance'])"
 
         #add rules into dicts
         self.amort_timing[rule_key] = time_rule
@@ -1370,6 +1453,7 @@ class CalcIntCapitalize(CashFlowBaseModule):
         self.add_cf_input_fields()
         
     def run_module(self):
+        self.update_cf_inputs()
         self.cf_model_data['int_cap'] = self.cf_input_data['int_trans_agg'] * self.cap_matrix * self.timing_rules
         
         #send balance changes
